@@ -37,10 +37,12 @@ trigger:
 
 ## 🚀 快速开始
 
-### 1. 安装
+### 1. 一键安装
 
 ```bash
-pip install browser-cookie3
+pip install browser-cookie3 && \
+git clone https://github.com/steptian/weread-mp.git && \
+cd weread-mp
 ```
 
 ### 2. Chrome 登录微信读书
@@ -241,6 +243,17 @@ pip3 install --user browser-cookie3
 ## 📃 许可
 
 MIT
+
+## ⚠️ 免责声明
+
+本工具使用了**微信读书（weread.qq.com）的非公开内部接口**，该接口未经腾讯官方文档化或授权。请知悉：
+
+- **仅供个人学习与研究使用**，请勿用于商业用途或大规模抓取
+- 请合理控制调用频率，避免对微信读书服务造成负担
+- 使用者应自行承担使用风险，作者不对因使用本工具导致的任何问题负责
+- 如腾讯官方对此类使用方式提出异议，本仓库将立即配合下架
+
+如果你喜欢这个工具并希望它持续可用，请低调使用，不要大规模传播或商业化。
 
 ---
 

@@ -30,10 +30,12 @@
 
 ## 🚀 快速开始
 
-### 1. 安装
+### 1. 一键安装
 
 ```bash
-pip install browser-cookie3
+pip install browser-cookie3 && \
+git clone https://github.com/steptian/weread-mp.git && \
+cd weread-mp
 ```
 
 ### 2. Chrome 登录微信读书
