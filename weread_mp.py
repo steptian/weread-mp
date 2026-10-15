@@ -210,7 +210,7 @@ def get_articles(cookie, book_id, limit=50):
     return articles
 
 
-def get_article_content(url, max_chars=3000):
+def get_article_content(url, max_chars=0):
     """获取文章正文"""
     if not url.startswith("http"):
         url = f"https://mp.weixin.qq.com/s/{url}"
@@ -361,8 +361,18 @@ def extract_js_content_html(head):
 
 
 def _html_to_text(body_html):
-    """正文 HTML → 纯文本（沿用旧 get_article_content 的规则）。"""
+    """正文 HTML → 纯文本。图片原位保留成 `[图片] URL` 行。
+
+    微信正文里的图全部在 `data-src` 上（实测 7/7 无 `src`），而且是懒加载的。
+    先把 img 换成标记再剥标签，否则图的位置信息就彻底丢了。
+    """
     t = body_html
+    # data-src 优先（真图），再兼容 src，最后兑一个没 URL 的占位
+    t = re.sub(r'<img[^>]*?data-src="([^"]+)"[^>]*/?>',
+               lambda m: f"\n[图片] {clean_js_url(m.group(1))}\n", t)
+    t = re.sub(r'<img[^>]*?src="([^"]+)"[^>]*/?>',
+               lambda m: f"\n[图片] {clean_js_url(m.group(1))}\n", t)
+    t = re.sub(r'<img[^>]*>', "\n[图片]\n", t)
     t = re.sub(r'<br\s*/?>', "\n", t)
     t = re.sub(r'</p>', "\n", t)
     t = re.sub(r'</section>', "\n", t)
@@ -373,7 +383,7 @@ def _html_to_text(body_html):
     return re.sub(r'\n{3,}', "\n\n", t).strip()
 
 
-def parse_article_from_head(head, url, max_chars=3000):
+def parse_article_from_head(head, url, max_chars=0):
     """从 /web/mp/content 的 head 里拼出 _print_article 要的字典。"""
     def meta(prop):
         m = re.search(r'property="' + prop + r'"\s+content="([^"]*)"', head)
@@ -587,7 +597,7 @@ def _print_article(art):
     else:
         print(f"\n{art['body']}")
         if art.get("truncated"):
-            print(f"\n  ...（截取前 {len(art['body'])} 字，加 --full 看全文）")
+            print(f"\n  ...（已截断到 {len(art['body'])} 字，去掉 --chars 看全文）")
 
 
 # ===== 新增: digest =====
@@ -869,7 +879,8 @@ def main():
     p_read = sub.add_parser("read", aliases=["r"], help="读取文章正文")
     p_read.add_argument("target")
     p_read.add_argument("--article", "-a", type=int, default=0)
-    p_read.add_argument("--full", "-f", action="store_true")
+    p_read.add_argument("--chars", "-c", type=int, default=0,
+                         help="截断到前 N 字（默认 0 = 全文）")
 
     p_digest = sub.add_parser("digest", aliases=["d"], help="一键早报: 遍历所有公众号最新文章")
     p_digest.add_argument("--per", type=int, default=3, help="每个号取几篇 (默认 3)")
@@ -915,8 +926,7 @@ def main():
     elif args.cmd in ("info", "i"):
         print("ℹ️  使用 articles 查看公众号信息")
     elif args.cmd in ("read", "r"):
-        max_chars = 0 if args.full else 3000
-        cmd_read(cookie, args.target, args.article, max_chars)
+        cmd_read(cookie, args.target, args.article, args.chars)
     elif args.cmd in ("digest", "d"):
         cmd_digest(cookie, args.per)
     elif args.cmd in ("search", "s"):

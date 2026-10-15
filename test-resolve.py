@@ -65,7 +65,9 @@ BODY = '''
 <div class="rich_media_content js_underline_content" id="js_content" style="visibility: hidden;">
 <section><p>第一段。</p></section>
 <div class="inner"><p>嵌套 div 里的第二段。</p><div><p>更深一层。</p></div></div>
+<p><img data-src="https://mmbiz.qpic.cn/mmbiz_png/ZZZ/640?wx_fmt=png&amp;from=appmsg" class="rich_pages wxw-img" data-w="1080" /></p>
 <p>第三段 &amp; 结束。</p>
+<p><img src="https://mmbiz.qpic.cn/mmbiz_png/YYY/0" data-w="500" /></p>
 </div>
 <div class="after">不该被吃进来</div>
 '''
@@ -74,9 +76,15 @@ assert "第一段。" in txt, txt
 assert "更深一层。" in txt, f"嵌套 div 被截断了: {txt!r}"
 assert "第三段 & 结束。" in txt, txt
 assert "不该被吃进来" not in txt, f"括号配对跑过头了: {txt!r}"
+# 图片原位保留：data-src 优先、src 兼容、URL 洗掉 &amp;
+assert txt.count("[图片]") == 2, txt
+assert "[图片] https://mmbiz.qpic.cn/mmbiz_png/ZZZ/640?wx_fmt=png&from=appmsg" in txt, txt
+assert "[图片] https://mmbiz.qpic.cn/mmbiz_png/YYY/0" in txt, txt
+i_img, i_p3 = txt.find("[图片]"), txt.find("第三段")
+assert 0 < i_img < i_p3, "图片位置错了：应夹在第二段和第三段之间"
 assert w.extract_js_content_html("<html>没这个容器</html>") == ""
 
 print("✅ resolve_wechat_url 通过")
 print("   ", url[:88] + "…")
 print(f"✅ parse_picture_pages 通过（{len(pics)} 张，含跳过与截断两种边界）")
-print("✅ 正文提取通过（嵌套 div 不截断）")
+print("✅ 正文提取通过（嵌套 div 不截断 + 图片原位保留）")
