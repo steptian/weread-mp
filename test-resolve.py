@@ -84,7 +84,34 @@ i_img, i_p3 = txt.find("[图片]"), txt.find("第三段")
 assert 0 < i_img < i_p3, "图片位置错了：应夹在第二段和第三段之间"
 assert w.extract_js_content_html("<html>没这个容器</html>") == ""
 
+# 正文里 img 的 URL 列表（--save-dir 用它）
+iu = w.extract_image_urls(BODY)
+assert iu == ["https://mmbiz.qpic.cn/mmbiz_png/ZZZ/640?wx_fmt=png&from=appmsg",
+              "https://mmbiz.qpic.cn/mmbiz_png/YYY/0"], iu
+assert w.extract_image_urls("<html>无图</html>") == []
+# 内联图 + 图集数组合并要去重
+assert w.article_image_urls(BODY, [{"url": iu[0], "w": 1, "h": 1}]) == iu
+
+# 文件名与扩展名
+assert w._safe_name("标题/带:非法*字符") == "标题_带_非法_字符", w._safe_name("标题/带:非法*字符")
+assert w._safe_name("///") == "img", w._safe_name("///")
+assert w._img_ext("https://x/a/640?wx_fmt=png") == ".png"
+assert w._img_ext("https://x/a/0?wx_fmt=JPEG") == ".jpeg"
+assert w._img_ext("https://x/a.jpg") == ".jpg"
+assert w._img_ext("https://x/abc") == ".jpg"
+
+# 按文件头嗅探真实类型：URL 里的 wx_fmt 不可信
+# （实测混知那篇 22 个 wx_fmt=gif 的链接返回的其实是 PNG）
+SNIFF = [(b"\x89PNG\r\n\x1a\nrest", ".png"), (b"\xff\xd8\xff\xe0rest", ".jpg"),
+         (b"GIF89arest", ".gif"), (b"GIF87arest", ".gif"),
+         (b"RIFF\x00\x00\x00\x00WEBPVP8 ", ".webp"),
+         (b"RIFF\x00\x00\x00\x00AVI ", ""),   # RIFF 不都是图
+         (b"<html>not an image</html>", "")]
+for data, exp in SNIFF:
+    assert w._sniff_ext(data) == exp, f"{data[:12]!r}: 得到 {w._sniff_ext(data)!r}，期望 {exp!r}"
+
 print("✅ resolve_wechat_url 通过")
 print("   ", url[:88] + "…")
 print(f"✅ parse_picture_pages 通过（{len(pics)} 张，含跳过与截断两种边界）")
 print("✅ 正文提取通过（嵌套 div 不截断 + 图片原位保留）")
+print("✅ 图片 URL / 文件名 / 扩展名 / 文件头嗅探 通过")

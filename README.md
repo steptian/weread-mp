@@ -22,7 +22,7 @@
 |------|------|
 | `list` | 列出所有已关注的公众号 |
 | `articles` | 获取某公众号的历史文章列表 |
-| `read` | 读全文：文字文章给完整正文（默认全文，正文里的图原位保留成 `[图片] URL`），图片消息列出图集 URL |
+| `read` | 读全文：文字文章给完整正文（默认全文，正文里的图原位保留成 `[图片] URL`），图片消息列出图集 URL；`--save-dir` 把图存到本地 |
 | `digest` | 一键遍历所有公众号生成早报 |
 | `search` | 跨公众号搜索标题/摘要 |
 | `export` | 导出为 Markdown / JSON |
@@ -85,6 +85,9 @@ python3 weread_mp.py read https://mp.weixin.qq.com/s/xxx
 
 # 默认就是全文；想要短一点就截断
 python3 weread_mp.py read MP_WXS_3073282833 --article 1 --chars 3000
+
+# 把文中图片存到本地（文件名前缀取自标题，不同文章不会撞）
+python3 weread_mp.py read MP_WXS_3073282833 --article 1 --save-dir ./imgs
 ```
 
 ### 关键词追踪

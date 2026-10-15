@@ -472,6 +472,91 @@ def get_picture_pages(cookie, book_id, original_id, head_bytes=1048576):
     return parse_picture_pages(head), None
 
 
+def extract_image_urls(head):
+    """正文里所有 img 的 URL，按出现顺序去重。data-src 优先、src 兼容。
+
+    和 _html_to_text 里那三条正则同一个判断逻辑，只是这里要拿 URL 而不是标记。
+    """
+    body = extract_js_content_html(head)
+    urls = []
+    for m in re.finditer(r'<img[^>]*?>', body):
+        tag = m.group(0)
+        mu = re.search(r'data-src="([^"]+)"', tag) or re.search(r'src="([^"]+)"', tag)
+        if not mu:
+            continue
+        u = clean_js_url(mu.group(1))
+        if u not in urls:
+            urls.append(u)
+    return urls
+
+
+def article_image_urls(head, pics):
+    """一篇文章的全部图：正文内联的 + 图集数组的（文字文章只有前者，图片消息只有后者）。"""
+    urls = extract_image_urls(head)
+    for p in pics:
+        if p["url"] not in urls:
+            urls.append(p["url"])
+    return urls
+
+
+def _safe_name(s, n=24):
+    """文件名前缀：非字母数字/汉字一律換成下划线，让不同文章落到不同文件名。"""
+    s = re.sub(r'[^\w\u4e00-\u9fff]+', "_", s).strip("_")
+    return s[:n] or "img"
+
+
+def _img_ext(url):
+    m = re.search(r'wx_fmt=([a-z0-9]+)', url, re.I)
+    if m:
+        return "." + m.group(1).lower()
+    m = re.search(r'\.(png|jpe?g|gif|webp)(?:[?#]|$)', url, re.I)
+    return "." + m.group(1).lower() if m else ".jpg"
+
+
+def _sniff_ext(data):
+    """按文件头判断真实图片类型；认不出返回空串。
+
+    ponytail: **不能信 URL 里的 wx_fmt**。实测混知那篇 22 个 wx_fmt=gif 的链接
+    返回的却是 PNG（微信给 /640 变体发了静态首帧）。扩展名写错的话很多看图工具
+    和预览直接认不出来。
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ""
+
+
+def download_images(urls, out_dir, prefix="img"):
+    """把图下载到 out_dir。返回 (成功数, 失败数)。
+
+    ponytail: 这里**不**加随机停顿 —— 目标是 mmbiz.qpic.cn 的 CDN，浏览器自己
+    就是并发拉一堆图的，不是微信读书那个会被风控的 API。真被限速了再说。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    ok = fail = 0
+    for n, u in enumerate(urls, 1):
+        try:
+            req = urllib.request.Request(u)
+            req.add_header("User-Agent", UA)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read()
+            # 先下到内存、嗅探真实类型再决定扩展名（URL 里的 wx_fmt 不可信）
+            path = os.path.join(out_dir, f"{prefix}{n:02d}{_sniff_ext(data) or _img_ext(u)}")
+            with open(path, "wb") as f:
+                f.write(data)
+            ok += 1
+            print(f"     💾 {os.path.basename(path)}  {len(data):>8d}B")
+        except Exception as e:
+            fail += 1
+            print(f"     ❌ {n:02d} 失败: {e}")
+    return ok, fail
+
+
 # ===== 命令实现 =====
 
 def cmd_list(cookie):
@@ -512,13 +597,15 @@ def cmd_articles(cookie, book_id, limit=50):
     print(f"💡 python3 weread_mp.py read {book_id} --article N 阅读全文")
 
 
-def cmd_read(cookie, target, article_idx, max_chars):
+def cmd_read(cookie, target, article_idx, max_chars, save_dir=None):
     if not target.startswith("MP_WXS"):
         # 直接 URL 或 originalId
         url = target
         if not url.startswith("http"):
             url = f"https://mp.weixin.qq.com/s/{url}"
         print(f"\n📖 正在读取文章...")
+        if save_dir:
+            print("⚠️  直接给链接的模式不支持 --save-dir（那走的是 mp.weixin 页面，不是微信读书的接口）")
         art, err = get_article_content(url, max_chars)
         if err:
             print(err)
@@ -545,13 +632,23 @@ def cmd_read(cookie, target, article_idx, max_chars):
             return
         url, _ = parse_og_url(head)
         result = parse_article_from_head(head, url or "", max_chars)
+        pics = parse_picture_pages(head)
+
+        if save_dir:
+            imgs = article_image_urls(head, pics)
+            if imgs:
+                print(f"\n  🖼  下载 {len(imgs)} 张图 -> {save_dir}")
+                ok, fail = download_images(imgs, save_dir, _safe_name(art["title"]))
+                print(f"     完成: {ok} 成功" + (f"，{fail} 失败" if fail else ""))
+            else:
+                print("\n  (这篇文章没有图)")
+
         if result["body"]:
             _print_article(result)
             return
 
         # 正文为空 → 图片消息（appmsg_type=9），正文就是图集。
         print(f"  🔗 真实链接: {url}")
-        pics = parse_picture_pages(head)
         if pics:
             print(f"\n  🖼  文中图片，共 {len(pics)} 张"
                   "（图片消息的话正文就是这些图）:")
@@ -881,6 +978,8 @@ def main():
     p_read.add_argument("--article", "-a", type=int, default=0)
     p_read.add_argument("--chars", "-c", type=int, default=0,
                          help="截断到前 N 字（默认 0 = 全文）")
+    p_read.add_argument("--save-dir", "-o", default=None,
+                         help="把文中图片下载到这个目录")
 
     p_digest = sub.add_parser("digest", aliases=["d"], help="一键早报: 遍历所有公众号最新文章")
     p_digest.add_argument("--per", type=int, default=3, help="每个号取几篇 (默认 3)")
@@ -926,7 +1025,7 @@ def main():
     elif args.cmd in ("info", "i"):
         print("ℹ️  使用 articles 查看公众号信息")
     elif args.cmd in ("read", "r"):
-        cmd_read(cookie, args.target, args.article, args.chars)
+        cmd_read(cookie, args.target, args.article, args.chars, args.save_dir)
     elif args.cmd in ("digest", "d"):
         cmd_digest(cookie, args.per)
     elif args.cmd in ("search", "s"):
