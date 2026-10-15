@@ -21,6 +21,9 @@ from datetime import datetime, date
 WEREAD_HOST = "https://weread.qq.com"
 STATE_FILE = os.path.expanduser("~/.weread_mp_state.json")
 
+# read 默认的落盘根目录：<根>/<标题>/ 下放一份 .md + 文中图（图相对路径内嵌）
+DEFAULT_OUT_DIR = "weread_out"
+
 # 请求之间的停顿区间（秒）。固定间隔容易被风控认成脚本，抖动一下。
 # ponytail: 这两个数是拍脑袋定的，没有定量依据。被 -2041 挡了就往上调。
 SLEEP_PAGE = (0.8, 2.4)     # 翻页（同一篇文章列表的下一页）
@@ -532,13 +535,14 @@ def _sniff_ext(data):
 
 
 def download_images(urls, out_dir, prefix="img"):
-    """把图下载到 out_dir。返回 (成功数, 失败数)。
+    """把图下载到 out_dir。返回 (成功数, 失败数, {url: 文件名})。
 
     ponytail: 这里**不**加随机停顿 —— 目标是 mmbiz.qpic.cn 的 CDN，浏览器自己
     就是并发拉一堆图的，不是微信读书那个会被风控的 API。真被限速了再说。
     """
     os.makedirs(out_dir, exist_ok=True)
     ok = fail = 0
+    saved = {}
     for n, u in enumerate(urls, 1):
         try:
             req = urllib.request.Request(u)
@@ -546,15 +550,45 @@ def download_images(urls, out_dir, prefix="img"):
             with urllib.request.urlopen(req, timeout=30) as r:
                 data = r.read()
             # 先下到内存、嗅探真实类型再决定扩展名（URL 里的 wx_fmt 不可信）
-            path = os.path.join(out_dir, f"{prefix}{n:02d}{_sniff_ext(data) or _img_ext(u)}")
-            with open(path, "wb") as f:
+            name = f"{prefix}{n:02d}{_sniff_ext(data) or _img_ext(u)}"
+            with open(os.path.join(out_dir, name), "wb") as f:
                 f.write(data)
+            saved[u] = name
             ok += 1
-            print(f"     💾 {os.path.basename(path)}  {len(data):>8d}B")
+            print(f"     💾 {name}  {len(data):>8d}B")
         except Exception as e:
             fail += 1
             print(f"     ❌ {n:02d} 失败: {e}")
-    return ok, fail
+    return ok, fail, saved
+
+
+def _md_body(body, saved):
+    """`[图片] URL` → `![](本地文件)`。没下成本地的保留原 URL，不静默丢图。"""
+    def sub(m):
+        u = m.group(1)
+        return f"![]({saved[u]})" if u in saved else f"[图片]({u})"
+    return re.sub(r'^\[图片\][ \t]*(\S+)$', sub, body, flags=re.M)
+
+
+def write_article_md(art, out_dir, saved, pics=()):
+    """把文章写成 Markdown。返回落盘路径。
+
+    落到 <out_dir>/<标题>.md，图就在旁边，`![](xx.jpg)` 相对路径直接能渲染。
+    """
+    body = _md_body(art.get("body") or "", saved)
+    if not body and pics:                       # 图片消息：正文就是图集
+        body = "\n\n".join(f"![]({saved.get(p['url'], p['url'])})" for p in pics)
+    head = [f"# {art['title']}", ""]
+    for icon, key in (("✍️", "author"), ("🕐", "pub_time"), ("📝", "desc")):
+        if art.get(key):
+            head.append(f"> {icon} {art[key]}")
+    if art.get("url"):
+        head.append(f"> 🔗 {art['url']}")
+    head += ["", "---", ""]
+    path = os.path.join(out_dir, f"{_safe_name(art['title'], 40)}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(head) + body + "\n")
+    return path
 
 
 # ===== 命令实现 =====
@@ -612,6 +646,8 @@ def cmd_read(cookie, target, article_idx, max_chars, save_dir=None):
             return
         _print_article(art)
     else:
+        save_dir = save_dir or DEFAULT_OUT_DIR    # 不传就默认落盘（--no-save 已置成 None）
+        arts = get_articles(cookie, target, limit=30)
         arts = get_articles(cookie, target, limit=30)
         if not arts:
             print("⚠️  未获取到文章（若是风控 -2041，按上面的提示过验证码）")
@@ -634,14 +670,22 @@ def cmd_read(cookie, target, article_idx, max_chars, save_dir=None):
         result = parse_article_from_head(head, url or "", max_chars)
         pics = parse_picture_pages(head)
 
+        saved = {}
         if save_dir:
+            # 每篇一个子目录：图与 .md 同目录，才能用相对路径嵌图
+            out = os.path.join(save_dir, _safe_name(art["title"], 40))
             imgs = article_image_urls(head, pics)
             if imgs:
-                print(f"\n  🖼  下载 {len(imgs)} 张图 -> {save_dir}")
-                ok, fail = download_images(imgs, save_dir, _safe_name(art["title"]))
+                print(f"\n  🖼  下载 {len(imgs)} 张图 -> {out}")
+                ok, fail, saved = download_images(imgs, out, _safe_name(art["title"]))
                 print(f"     完成: {ok} 成功" + (f"，{fail} 失败" if fail else ""))
             else:
-                print("\n  (这篇文章没有图)")
+                print(f"\n  (这篇文章没有图) -> {out}")
+            try:
+                md = write_article_md(result, out, saved, pics)
+                print(f"  📄 Markdown -> {md}")
+            except OSError as e:
+                print(f"  ⚠️  Markdown 写出失败: {e}")
 
         if result["body"]:
             _print_article(result)
@@ -951,7 +995,7 @@ def cmd_track_check(cookie):
 
 # ===== 主入口 =====
 
-VERSION = "2.0.0"
+VERSION = "2.2.0"
 
 
 def main():
@@ -979,7 +1023,10 @@ def main():
     p_read.add_argument("--chars", "-c", type=int, default=0,
                          help="截断到前 N 字（默认 0 = 全文）")
     p_read.add_argument("--save-dir", "-o", default=None,
-                         help="把文中图片下载到这个目录")
+                         help=f"输出根目录（默认 ./{DEFAULT_OUT_DIR}）：每篇文章一个子目录，"
+                              "含 <标题>.md（图内嵌）与文中图片")
+    p_read.add_argument("--no-save", action="store_true",
+                         help="只打印到终端，不下载图片、不写 .md")
 
     p_digest = sub.add_parser("digest", aliases=["d"], help="一键早报: 遍历所有公众号最新文章")
     p_digest.add_argument("--per", type=int, default=3, help="每个号取几篇 (默认 3)")
@@ -1025,7 +1072,8 @@ def main():
     elif args.cmd in ("info", "i"):
         print("ℹ️  使用 articles 查看公众号信息")
     elif args.cmd in ("read", "r"):
-        cmd_read(cookie, args.target, args.article, args.chars, args.save_dir)
+        cmd_read(cookie, args.target, args.article, args.chars,
+                 None if args.no_save else args.save_dir)
     elif args.cmd in ("digest", "d"):
         cmd_digest(cookie, args.per)
     elif args.cmd in ("search", "s"):

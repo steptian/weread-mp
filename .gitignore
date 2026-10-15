@@ -4,3 +4,5 @@ __pycache__/
 .env
 *.state.json
 
+# read 的默认输出目录
+weread_out/

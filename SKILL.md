@@ -1,7 +1,7 @@
 ---
 name: weread-mp
 description: 通过微信读书内部 API 订阅任意公众号，主题阅读、关键词追踪。自动从浏览器 cookie 库解密登录态。
-version: 2.0.0
+version: 2.2.0
 tags:
   - 公众号
   - 微信读书
@@ -29,7 +29,7 @@ trigger:
 |------|------|
 | **list** | 列出所有已关注的公众号 |
 | **articles** | 获取某公众号的历史文章列表 |
-| **read** | 读全文（默认全文，`--chars N` 截断）：**文字文章**给完整正文，正文里的图原位保留成 `[图片] URL`；**图片消息**（如混知）列出图集 URL；`--save-dir` 把图存到本地；两者都给真实公开链接 |
+| **read** | 读全文（默认全文，`--chars N` 截断）。**默认落盘** `./weread_out/<标题>/`：`<标题>.md`（图相对路径内嵌，预览器直接能看）+ 文中图片；`--no-save` 只打印，`-o` 换根目录。终端一份：**文字文章**给完整正文且图原位保留成 `[图片] URL`；**图片消息**（如混知）列出图集 URL；两者都给真实公开链接 |
 | **digest** | 一键遍历所有公众号生成早报 |
 | **search** | 跨公众号搜索标题/摘要 |
 | **export** | 导出为 Markdown / JSON |
@@ -97,8 +97,12 @@ python3 weread_mp.py read ggsDTrCt3N1elArnpLf9uw
 # 默认就是全文；想要短一点就截断
 python3 weread_mp.py read MP_WXS_3073282833 --article 1 --chars 3000
 
-# 把文中图片存到本地
+# 默认：下载图片 + 生成 md，落到 ./weread_out/<标题>/
+python3 weread_mp.py read MP_WXS_3073282833 --article 1
+
+# 换输出根目录 / 只要终端不碰磁盘
 python3 weread_mp.py read MP_WXS_3073282833 --article 1 --save-dir ./imgs
+python3 weread_mp.py read MP_WXS_3073282833 --article 1 --no-save
 ```
 
 ### 早报
