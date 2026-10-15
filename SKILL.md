@@ -29,7 +29,7 @@ trigger:
 |------|------|
 | **list** | 列出所有已关注的公众号 |
 | **articles** | 获取某公众号的历史文章列表 |
-| **read** | 阅读文章完整正文 |
+| **read** | 读全文：**文字文章**给完整正文，**图片消息**（如混知）列出图集 URL；两者都给真实公开链接 |
 | **digest** | 一键遍历所有公众号生成早报 |
 | **search** | 跨公众号搜索标题/摘要 |
 | **export** | 导出为 Markdown / JSON |
@@ -167,9 +167,24 @@ python3 weread_mp.py --cookie "wr_skey=xxx; wr_vid=xxx" list
        ↓
     公众号文章列表（标题、摘要、阅读量、点赞量、原文链接）
        ↓
-    GET https://mp.weixin.qq.com/s/{originalId}
+    GET https://weread.qq.com/web/mp/content?reviewId={bookId}_{originalId}
        ↓
-    文章完整正文
+    响应头部 ~17KB 处的 og:url（canonical 的 mp.weixin.qq.com/s?__biz=..&mid=..&idx=..&sn=..）
+       ↓
+    读前 96KB 就够（不必拉完整 ~2.6MB），拆掉 chksm 后即为可打开的链接
+```
+
+### ⚠️ 关于 originalId（2026-10 变更）
+
+微信读书的 `mpInfo.originalId` 已从 22 字符短链 token 换成 **75 字符不透明 id**
+（base64 → 56 字节，高熵，不可逆）：
+
+```
+旧  ggsDTrCt3N1elArnpLf9uw                      →  mp.weixin.qq.com/s/{id}  ✅ 能读
+新  WR1EkJ9AcEvy2XsC4QGyH1gj9u83Gg4NL62g...     →  mp.weixin.qq.com/s/{id}  ❌ 参数错误
+```
+
+所以 `read` 不再自己拼 URL，改为走 `/web/mp/content` 拿真实链接。
 ```
 
 ## ⚠️ 常见问题
@@ -236,7 +251,19 @@ pip3 install --user browser-cookie3
 
 - 只能获取**已在微信读书 App 中关注**的公众号
 - 依赖浏览器中的 `wr_skey` cookie，过期需重新扫码
-- 正文抓取依赖 `mp.weixin.qq.com` 公开页面，极少数情况可能被反爬
+- **正文从 `/web/mp/content` 拿，不是从 mp.weixin.qq.com**：
+  拿 canonical 链接直接 curl 会 302 到验证页，浏览器里也只给预览页。
+  但微信读书代理回来的同一篇 HTML 里**有完整正文**（`<div class="rich_media_content"
+  `id="js_content">`，在 ~557KB 处），另外 `og:url`(~17KB)、`picture_page_info_list`
+  (~225KB) 也在。默认读 1MB 一次拿全。
+  ⚠️ 取正文容器必须做 **div 括号配对** —— 正文有嵌套 div，非贪婪 `(.*?)</div>`
+  会在第一个 `</div>` 就截断（旧版就是死在这里）。
+- **图片消息**（`appmsg_type=9`，如混知）没有文字正文，`read` 改列图集 URL。
+  每个 item 内部有 4 个 `cdn_url`（原图/file_size/主图/分享封面），只有主图
+  带真实宽高，其余是 `0x0`，靠 `w>0` 筛掉；URL 还要洗 `\\x26` 和 `&amp;amp;`
+- **风控**：`/web/mp/articles` 会返回 `-2041` 并要求过腾讯验证码
+  （「选择最符合描述的图片」）。过完后可用，但**会重新武装**，不是一次性的。
+  同 session 的 `/web/shelf/sync` 不受影响
 - 与 weread 官方 API key 体系（`wrk-xxx`）**不互通**，需两套认证
 - 目前仅支持 Chrome/Chromium 系浏览器自动提取 cookie，Firefox/Safari 需手动传入
 

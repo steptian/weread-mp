@@ -22,7 +22,7 @@
 |------|------|
 | `list` | 列出所有已关注的公众号 |
 | `articles` | 获取某公众号的历史文章列表 |
-| `read` | 阅读文章完整正文 |
+| `read` | 读全文：文字文章给完整正文，图片消息列出图集 URL |
 | `digest` | 一键遍历所有公众号生成早报 |
 | `search` | 跨公众号搜索标题/摘要 |
 | `export` | 导出为 Markdown / JSON |
@@ -118,21 +118,52 @@ python3 weread_mp.py export MP_WXS_3073282833 --format json > articles.json
 ## 🔧 原理
 
 ```
-浏览器 cookie 数据库
-  (Chrome/Edge/Brave)
+浏览器 cookie 数据库（Chrome/Edge/Brave）
        ↓ browser-cookie3 自动解密
     wr_skey + wr_vid + ...
        ↓
-    GET https://weread.qq.com/web/mp/articles
+GET https://weread.qq.com/web/mp/articles?bookId=MP_WXS_xxx&offset=0
        ↓
-    公众号文章列表（标题、摘要、阅读量、点赞量、原文链接）
+公众号文章列表（标题、摘要、阅读量、点赞量、originalId）
        ↓
-    GET https://mp.weixin.qq.com/s/{id}
-       ↓
-    文章完整正文
+GET https://weread.qq.com/web/mp/content?reviewId={bookId}_{originalId}
+   （响应约 3.5MB，脚本只读前 1MB）
+       ├─ og:url                  ~17KB  → canonical 公开链接（拆掉 chksm）
+       ├─ picture_page_info_list  ~225KB → 图片消息的图集
+       └─ rich_media_content      ~557KB → 文字正文
 ```
 
-关键点：公众号文章正文其实在 `mp.weixin.qq.com` 上是**公开可访问的**，你只是不知道链接在哪。微信读书的 API 恰好能给你这个链接。
+**关键点：正文不从 `mp.weixin.qq.com` 直接拿。** 那条路对桌面端会 302 到验证页、或者只给预览页（`#js_content` 里只有摘要那百来字）。但微信读书代理回来的**同一篇 HTML 里就有完整正文** —— 这才是能拿到全文的原因。
+
+三个坑（代码注释里也有）：
+
+1. **取正文容器必须做 `div` 括号配对**。正文里有嵌套 `<div>`，非贪婪 `(.*?)</div>` 会在第一个 `</div>` 截断 —— 旧版就是死在这里。
+2. **`chksm` 要去掉**。它是每次请求现算的校验和，带着它访问 canonical 链接会 302 到 `/mp/wappoc_appmsgcaptcha`（「环境异常」）。
+3. **图集 URL 是脏的**：形如 `...?wx_fmt=png\x26amp;amp;from=appmsg`，要洗掉 JS 转义和两层 HTML 实体，否则图打不开。
+
+## 📌 2026-10 重要变更
+
+### `originalId` 换格式了
+
+微信读书 `mpInfo.originalId` 从 **22 字符短链 token** 变成 **75 字符不透明 id**：
+
+```
+旧  ggsDTrCt3N1elArnpLf9uw                     →  mp.weixin.qq.com/s/{id}  ✅
+新  WR1EkJ9AcEvy2XsC4QGyH1gj9u83Gg4NL62g…      →  mp.weixin.qq.com/s/{id}  ❌ 参数错误
+```
+
+逆推不可行：base64 解出 56 字节，其中 36 字节熵 7.09 bit/byte（近均匀随机），
+与 `mid` / `idx` 无可见对应，而且前端 JS 里根本搜不到 `originalId`（它只把
+`reviewId = {bookId}_{originalId}` 原样丢给服务端）。所以 `read` 不再自己拼 URL，
+改走 `/web/mp/content` 换真实链接。
+
+### 风控验证码
+
+`/web/mp/articles` 会返回 `errCode: -2041`，页面弹腾讯验证码（「选择最符合描述的图片」）。
+过掉之后可用，但**会重新武装**，不是一次性的；同 session 的 `/web/shelf/sync` 不受影响。
+
+脚本请求之间用**随机区间**停顿（`SLEEP_PAGE` / `SLEEP_ACCOUNT` 两个常量）—— 固定间隔
+容易被认成脚本。被挡了就调大这两个区间。
 
 ## ⚠️ cookie 过期处理
 
@@ -154,8 +185,16 @@ python3 weread_mp.py export MP_WXS_3073282833 --format json > articles.json
 
 - 只能获取**已在微信读书 App 中关注**的公众号（不是微信里的关注）
 - 依赖浏览器中的 `wr_skey` cookie，过期需重新扫码
-- 正文抓取依赖 `mp.weixin.qq.com` 公开页面，极少数情况可能被反爬
+- 正文与图集都走 `/web/mp/content`（微信读书代理的那份 HTML），不依赖 `mp.weixin.qq.com` 能否直接访问
 - 自动提取 cookie 仅支持 Chrome/Edge/Brave，Firefox/Safari 需手动传入 `--cookie`
+
+## 🧪 自检
+
+```bash
+python3 test-resolve.py
+```
+
+断言链接解析、图集解析（脏 URL / 缺宽高 / `0x0` / 数组截断）、正文提取（嵌套 `div` 不截断）。需要 Chrome 里已登录 weread.qq.com。
 
 ## 🤝 贡献
 

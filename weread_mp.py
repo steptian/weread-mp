@@ -9,6 +9,7 @@
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -19,6 +20,16 @@ from datetime import datetime, date
 
 WEREAD_HOST = "https://weread.qq.com"
 STATE_FILE = os.path.expanduser("~/.weread_mp_state.json")
+
+# 请求之间的停顿区间（秒）。固定间隔容易被风控认成脚本，抖动一下。
+# ponytail: 这两个数是拍脑袋定的，没有定量依据。被 -2041 挡了就往上调。
+SLEEP_PAGE = (0.8, 2.4)     # 翻页（同一篇文章列表的下一页）
+SLEEP_ACCOUNT = (2.0, 5.0)  # 跨公众号（digest / search / track）
+
+
+def polite_sleep(rng):
+    """在 rng 区间里随机歇一下。"""
+    time.sleep(random.uniform(*rng))
 
 
 # ===== 状态管理（增量监控 + 关键词追踪） =====
@@ -73,7 +84,7 @@ def extract_cookies():
         print("   (支持 Chrome / Edge / Brave / Chromium / Opera / Vivaldi)")
         sys.exit(1)
 
-    last_error = None
+    errors = []
     for browser_fn, browser_name in SUPPORTED_BROWSERS:
         try:
             loader = getattr(bc, browser_fn, None)
@@ -90,7 +101,7 @@ def extract_cookies():
                     cookie_parts.append(f"{name}={value}")
                 return "; ".join(cookie_parts)
         except Exception as e:
-            last_error = e
+            errors.append((browser_name, e))
             continue
 
     print("❌ 未能从浏览器中提取 weread.qq.com 的 cookie")
@@ -99,8 +110,13 @@ def extract_cookies():
     print()
     print("       python3 weread_mp.py --cookie 'wr_skey=xxx; wr_vid=xxx' list")
     print()
-    if last_error:
-        print(f"   原始错误: {last_error}")
+    for name, err in errors:
+        print(f"   {name}: {err}")
+    # browser-cookie3 把「读不了库」伪装成普通错误；macOS 上多半是 TCC
+    if any("Unable to read database file" in str(e) for _, e in errors):
+        print()
+        print("   ⚠️  以上可能是 macOS 完全磁盘访问权限（TCC）拦的，不代表没登录：")
+        print("      系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 勾选你的终端 App")
     sys.exit(1)
 
 # ===== API 调用 =====
@@ -127,6 +143,12 @@ def api_call(path, cookie, params=None):
                     print("   请在 Chrome 中重新打开 https://weread.qq.com")
                     print("   扫码登录后重新运行本脚本")
                     sys.exit(1)
+                if str(err_code) == "-2041":
+                    # 风控验证码。以前这里是静默的，外面只看到「未获取到文章」。
+                    print("\n⚠️  微信读书风控：该接口返回 -2041")
+                    print("   在 Chrome 打开 https://weread.qq.com/web/shelf，点进任一公众号，")
+                    print("   过掉弹出的「选择最符合描述的图片」验证码，然后重跑本脚本。")
+                    print("   注意：验证码是会重新武装的，不是过一次就永久生效。")
         return data
     except urllib.request.HTTPError as e:
         if e.code in (401, 403):
@@ -184,7 +206,7 @@ def get_articles(cookie, book_id, limit=50):
         offset = min_time
         if len(reviews) < 10:
             break
-        time.sleep(0.3)
+        polite_sleep(SLEEP_PAGE)
     return articles
 
 
@@ -255,7 +277,189 @@ def fmt_time(ts):
 
 
 def art_link(original_id):
-    return f"https://mp.weixin.qq.com/s/{original_id}" if original_id else ""
+    """ponytail: 2026-10 起 weread 的 originalId 换成了 75 字符不透明 id，
+    拼不出可访问的 mp.weixin.qq.com 链接（旧写法 /s/{id} 会返回「参数错误」）。
+    真实链接必须过一次 resolve_wechat_url()。这里返回空串，让调用方跳过打印。"""
+    return ""
+
+
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+
+
+def fetch_mp_content(cookie, book_id, original_id, head_bytes=1048576):
+    """拉 /web/mp/content 的前 head_bytes 字节。返回 (head, 错误)。
+
+    响应约 3.5MB，全文一次就够，各字段的 offset（实测）：
+      og:url             ~17KB
+      picture_page_info_list  ~225KB
+      rich_media_content 正文  ~557KB
+    所以默认 1MB；只要链接的时候传 head_bytes=98304 省流量。
+    """
+    if not (book_id and original_id):
+        return None, "❌ 缺少 bookId / originalId"
+    rid = urllib.parse.quote(f"{book_id}_{original_id}")
+    req = urllib.request.Request(f"{WEREAD_HOST}/web/mp/content?reviewId={rid}")
+    req.add_header("Cookie", cookie)
+    req.add_header("User-Agent", UA)
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        head = resp.read(head_bytes).decode("utf-8", "replace")
+        resp.close()
+    except Exception as e:
+        return None, f"❌ 取 /web/mp/content 失败: {e}"
+    return head, None
+
+
+def parse_og_url(head):
+    """取 canonical 链接（mp.weixin.qq.com/s?__biz=..&mid=..&idx=..&sn=..）。
+
+    ponytail: 微信的 chksm 是每次请求现算的校验和。带着它访问会 302 到
+    /mp/wappoc_appmsgcaptcha（「环境异常，完成验证后即可继续访问」）；
+    去掉 chksm 后同一个链接直接能打开（2026-10-15 实测，标题对得上）。
+    """
+    m = re.search(r'property="og:url"\s+content="([^"]+)"', head)
+    if not m:
+        return None, "❌ 响应里没有 og:url"
+    raw = html_mod.unescape(m.group(1)).split("#")[0]
+    parts = urllib.parse.urlsplit(raw)
+    q = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query) if k != "chksm"]
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(q))), None
+
+
+def resolve_wechat_url(cookie, book_id, original_id, head_bytes=98304):
+    """把不透明的 originalId 换成真实公开链接（只要链接时的轻量入口）。"""
+    head, err = fetch_mp_content(cookie, book_id, original_id, head_bytes)
+    if err:
+        return None, err
+    return parse_og_url(head)
+
+
+def extract_js_content_html(head):
+    """从 /web/mp/content 里取正文容器的 innerHTML。
+
+    容器是 <div class="rich_media_content ..." id="js_content">。
+    不能像旧代码那样用非贪婪 `(.*?)</div>` —— 正文里有嵌套 div，会在第一个
+    </div> 截断（这正是旧 get_article_content 拿不到正文的原因）。
+    这里做真正的 div 括号配对，并跳过 <div 出现在注释/字符串里的情况（实测正文没踩到）。
+    """
+    m = re.search(r'<div[^>]*class="rich_media_content[^"]*"[^>]*id="js_content"[^>]*>', head)
+    if not m:
+        return ""
+    start, k, depth = m.end(), m.end(), 1
+    while depth and k < len(head):
+        nxt_o, nxt_c = head.find("<div", k), head.find("</div>", k)
+        if nxt_c < 0:
+            return ""
+        if 0 <= nxt_o < nxt_c:
+            depth += 1
+            k = nxt_o + 4
+        else:
+            depth -= 1
+            k = nxt_c + 6
+    return head[start:k - 6] if depth == 0 else ""
+
+
+def _html_to_text(body_html):
+    """正文 HTML → 纯文本（沿用旧 get_article_content 的规则）。"""
+    t = body_html
+    t = re.sub(r'<br\s*/?>', "\n", t)
+    t = re.sub(r'</p>', "\n", t)
+    t = re.sub(r'</section>', "\n", t)
+    t = re.sub(r'</div>', "\n", t)
+    t = re.sub(r'<[^>]+>', "", t)
+    t = re.sub(r'&nbsp;', " ", t)
+    t = html_mod.unescape(t)
+    return re.sub(r'\n{3,}', "\n\n", t).strip()
+
+
+def parse_article_from_head(head, url, max_chars=3000):
+    """从 /web/mp/content 的 head 里拼出 _print_article 要的字典。"""
+    def meta(prop):
+        m = re.search(r'property="' + prop + r'"\s+content="([^"]*)"', head)
+        return html_mod.unescape(m.group(1)).strip() if m else ""
+
+    body = ""
+    truncated = False
+    if extract_js_content_html(head):
+        body = _html_to_text(extract_js_content_html(head))
+        if max_chars and len(body) > max_chars:
+            body, truncated = body[:max_chars], True
+    pub_time = ""
+    m = re.search(r'<em[^>]*id="publish_time"[^>]*>(.*?)</em>', head)
+    if m:
+        pub_time = m.group(1).strip()
+    return {"title": meta("og:title"), "author": meta("og:article:author"),
+            "desc": meta("og:description"), "cover": meta("og:image"),
+            "pub_time": pub_time, "body": body, "truncated": truncated, "url": url}
+
+
+def parse_picture_pages(head):
+    """从 /web/mp/content 的 HTML 里抽图片消息的图集（picture_page_info_list）。
+
+    这不是 JSON，是 JS 对象字面量（键无引号、值后面跟 ` * 1`），所以只能拆字符串。
+    先括号配对拿到整个数组，再按 `cdn_url:` 切分逐项解析，比一条大正则稳。
+    """
+    i = head.find("picture_page_info_list:")
+    if i < 0:
+        return []
+    j = head.find("[", i)
+    if j < 0:
+        return []
+    seg, depth = None, 0
+    for k in range(j, len(head)):
+        if head[k] == "[":
+            depth += 1
+        elif head[k] == "]":
+            depth -= 1
+            if depth == 0:
+                seg = head[j:k + 1]
+                break
+    if seg is None:
+        print("⚠️  picture_page_info_list 未闭合（head_bytes 读少了，图集被截断）")
+        return []
+    # 每个 item 内部有 4 个 cdn_url（原图 / file_size / 主图 / 分享封面），
+    # 只有主图带真实宽高，其余是 0x0 —— 用 w>0 把它们筛掉，实测正好剩主图。
+    seen, out = set(), []
+    for item in seg.split("cdn_url:")[1:]:
+        mu = re.search(r"^\s*'([^']+)'", item)
+        mw = re.search(r"width:\s*'?(\d+)", item)
+        mh = re.search(r"height:\s*'?(\d+)", item)
+        if not (mu and mw and mh):
+            continue
+        w, h = int(mw.group(1)), int(mh.group(1))
+        url = clean_js_url(mu.group(1))
+        if w <= 0 or h <= 0 or url in seen:
+            continue
+        seen.add(url)
+        out.append({"url": url, "w": w, "h": h})
+    return out
+
+def clean_js_url(raw):
+    """把 JS 字符串里的 URL 洗干净。
+
+    实测拿到的长这样（HTML 实体和 JS 转义叠了两三层）：
+        .../0?wx_fmt=png\\x26amp;amp;from=appmsg
+    `\\x26` 是 JS 写的 `&`；`&amp;amp;` 要 HTML 反转义不止一次。不洗的话图打不开。
+    """
+    u = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), raw)
+    for _ in range(3):
+        n = html_mod.unescape(u)
+        if n == u:
+            break
+        u = n
+    return u
+
+
+def get_picture_pages(cookie, book_id, original_id, head_bytes=1048576):
+    """图片消息（appmsg_type=9）的图集。正文不在 HTML 里，图集在这个数组里。
+
+    数组位置在 ~225KB 处，所以要比取 og:url（~17KB）读得多。返回 (列表, 错误)。
+    """
+    head, err = fetch_mp_content(cookie, book_id, original_id, head_bytes)
+    if err:
+        return [], err
+    return parse_picture_pages(head), None
 
 
 # ===== 命令实现 =====
@@ -313,6 +517,7 @@ def cmd_read(cookie, target, article_idx, max_chars):
     else:
         arts = get_articles(cookie, target, limit=30)
         if not arts:
+            print("⚠️  未获取到文章（若是风控 -2041，按上面的提示过验证码）")
             return
         if article_idx <= 0 or article_idx > len(arts):
             _print_article_list(arts)
@@ -322,13 +527,28 @@ def cmd_read(cookie, target, article_idx, max_chars):
         if not art.get("original_id"):
             print("❌ 无 originalId")
             return
-        url = f"https://mp.weixin.qq.com/s/{art['original_id']}"
         print(f"\n📖 正在读取: {art['title']}")
-        result, err = get_article_content(url, max_chars)
+        # 一次拉 1MB 的 /web/mp/content，链接 / 正文 / 图集全在里面。
+        head, err = fetch_mp_content(cookie, target, art["original_id"])
         if err:
             print(err)
             return
-        _print_article(result)
+        url, _ = parse_og_url(head)
+        result = parse_article_from_head(head, url or "", max_chars)
+        if result["body"]:
+            _print_article(result)
+            return
+
+        # 正文为空 → 图片消息（appmsg_type=9），正文就是图集。
+        print(f"  🔗 真实链接: {url}")
+        pics = parse_picture_pages(head)
+        if pics:
+            print(f"\n  🖼  文中图片，共 {len(pics)} 张"
+                  "（图片消息的话正文就是这些图）:")
+            for n, p in enumerate(pics, 1):
+                print(f"   {n:2d}. {p['w']:>4d}x{p['h']:<4d}  {p['url']}")
+        else:
+            print("\n  (正文与图集都为空)")
 
 
 def _print_article_list(arts):
@@ -387,7 +607,9 @@ def cmd_digest(cookie, per_account=3):
     print(f"{'='*60}\n")
 
     all_new = 0
-    for b in mps:
+    for i, b in enumerate(mps):
+        if i:
+            polite_sleep(SLEEP_ACCOUNT)
         title = b.get("title", "未知")
         book_id = b.get("bookId", "")
         print(f"── {title} ──")
@@ -417,6 +639,7 @@ def cmd_digest(cookie, per_account=3):
         print(f"{'='*60}")
         # 重新扫一遍所有号的全部文章找匹配
         for b in mps:
+            polite_sleep(SLEEP_ACCOUNT)
             book_id = b.get("bookId", "")
             mp_name = b.get("title", "")
             arts = get_articles(cookie, book_id, limit=10)
@@ -430,9 +653,7 @@ def cmd_digest(cookie, per_account=3):
             if matched:
                 print(f"\n  📌 {mp_name}:")
                 for kw, a in matched:
-                    link = art_link(a["original_id"])
                     print(f"    [{kw}] {a['title']}")
-                    print(f"           {link}")
 
     save_state(state)
     if all_new:
@@ -467,10 +688,8 @@ def cmd_search(cookie, keyword, per_account=20):
             for a in matches:
                 found += 1
                 t = fmt_time(a["time"])
-                link = art_link(a["original_id"])
                 print(f"  {t}  👍{a['like_num']}")
                 print(f"  {a['title']}")
-                print(f"  {link}")
                 # 高亮匹配位置
                 idx = a["title"].lower().find(kw)
                 if idx >= 0:
@@ -479,7 +698,7 @@ def cmd_search(cookie, keyword, per_account=20):
                     snippet = a["title"][ctx_start:ctx_end]
                     print(f"  → ...{snippet}...")
                 print()
-            time.sleep(0.5)
+            polite_sleep(SLEEP_ACCOUNT)
 
     print(f"\n📊 共找到 {found} 篇匹配文章\n")
 
@@ -525,7 +744,8 @@ def cmd_export(cookie, book_id, output_format="md", limit=20):
             lines.append(f"")
             lines.append(f"- **时间**: {t}")
             lines.append(f"- **阅读**: 👍{a['like_num']}  👁{a.get('read_num', 0)}")
-            lines.append(f"- **链接**: [{link}]({link})")
+            if link:
+                lines.append(f"- **链接**: [{link}]({link})")
             if a["summary"]:
                 lines.append(f"- **摘要**: {a['summary']}")
             lines.append(f"")
@@ -582,6 +802,7 @@ def cmd_track_check(cookie):
 
     all_hits = []
     for b in mps:
+        polite_sleep(SLEEP_ACCOUNT)
         mp_name = b.get("title", "未知")
         book_id = b.get("bookId", "")
         arts = get_articles(cookie, book_id, limit=10)
@@ -603,7 +824,8 @@ def cmd_track_check(cookie):
                     t = fmt_time(a["time"])
                     link = art_link(a["original_id"])
                     print(f"     [{mp_name}] {t} {a['title']}{new_flag}")
-                    print(f"     {link}")
+                    if link:
+                        print(f"     {link}")
                 print()
         print(f"📊 共 {len(all_hits)} 篇命中")
     else:
@@ -611,6 +833,7 @@ def cmd_track_check(cookie):
 
     # 记录已扫描的文章
     for b in mps:
+        polite_sleep(SLEEP_ACCOUNT)
         book_id = b.get("bookId", "")
         arts = get_articles(cookie, book_id, limit=5)
         for a in arts:
